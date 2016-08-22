@@ -147,6 +147,7 @@ _installed_or_uninstalled_test_scripts = \
 	tests/test-signed-pull.sh \
 	tests/test-pre-signed-pull.sh \
 	tests/test-signed-pull-summary.sh \
+	tests/test-bootdir-update.sh \
 	$(NULL)
 
 if USE_GPGME

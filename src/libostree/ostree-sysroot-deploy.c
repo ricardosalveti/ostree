@@ -286,9 +286,52 @@ checksum_dir_recurse (int          dfd,
 }
 
 static gboolean
+hardlink_or_copy_at (int         src_dfd,
+                     const char *src_subpath,
+                     int         dest_dfd,
+                     const char *dest_subpath,
+                     OstreeSysrootDebugFlags flags,
+                     GCancellable  *cancellable,
+                     GError       **error)
+{
+  if (linkat (src_dfd, src_subpath, dest_dfd, dest_subpath, 0) != 0)
+    {
+      if (G_IN_SET (errno, EMLINK, EXDEV))
+        return glnx_file_copy_at (src_dfd, src_subpath, NULL, dest_dfd, dest_subpath,
+                                  sysroot_flags_to_copy_flags (0, flags),
+                                  cancellable, error);
+      else
+        return glnx_throw_errno_prefix (error, "linkat(%s)", dest_subpath);
+    }
+
+  return TRUE;
+}
+
+static gboolean
+hardlink_or_copy_dir_recurse (int  src_parent_dfd,
+                  int              dest_parent_dfd,
+                  const char      *name,
+                  gboolean         hardlink,
+                  OstreeSysrootDebugFlags flags,
+                  GCancellable    *cancellable,
+                  GError         **error);
+
+static gboolean
 copy_dir_recurse (int              src_parent_dfd,
                   int              dest_parent_dfd,
                   const char      *name,
+                  OstreeSysrootDebugFlags flags,
+                  GCancellable    *cancellable,
+                  GError         **error)
+{
+  return hardlink_or_copy_dir_recurse (src_parent_dfd, dest_parent_dfd, name, FALSE, flags, cancellable, error);
+}
+
+static gboolean
+hardlink_or_copy_dir_recurse (int  src_parent_dfd,
+                  int              dest_parent_dfd,
+                  const char      *name,
+                  gboolean         hardlink,
                   OstreeSysrootDebugFlags flags,
                   GCancellable    *cancellable,
                   GError         **error)
@@ -326,17 +369,28 @@ copy_dir_recurse (int              src_parent_dfd,
 
       if (S_ISDIR (child_stbuf.st_mode))
         {
-          if (!copy_dir_recurse (src_dfd_iter.fd, dest_dfd, dent->d_name,
-                                 flags, cancellable, error))
+          if (!hardlink_or_copy_dir_recurse (src_dfd_iter.fd, dest_dfd, dent->d_name,
+                                 hardlink, flags, cancellable, error))
             return FALSE;
         }
       else
         {
-          if (!glnx_file_copy_at (src_dfd_iter.fd, dent->d_name, &child_stbuf,
-                                  dest_dfd, dent->d_name,
-                                  sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
-                                  cancellable, error))
-            return glnx_prefix_error (error, "Copying %s", dent->d_name);
+          if (hardlink)
+            {
+              if (!hardlink_or_copy_at (src_dfd_iter.fd, dent->d_name,
+                                        dest_dfd, dent->d_name,
+                                        sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
+                                        cancellable, error))
+                return FALSE;
+            }
+          else
+            {
+              if (!glnx_file_copy_at (src_dfd_iter.fd, dent->d_name, &child_stbuf,
+                                      dest_dfd, dent->d_name,
+                                      sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
+                                      cancellable, error))
+                return glnx_prefix_error (error, "Copying %s", dent->d_name);
+            }
         }
     }
 
@@ -1749,6 +1803,7 @@ install_deployment_kernel (OstreeSysroot   *sysroot,
 
 {
   GLNX_AUTO_PREFIX_ERROR ("Installing kernel", error);
+  g_auto(GLnxDirFdIterator) dfd_iter = { 0, };
   OstreeBootconfigParser *bootconfig = ostree_deployment_get_bootconfig (deployment);
   g_autofree char *deployment_dirpath = ostree_sysroot_get_deployment_dirpath (sysroot, deployment);
   glnx_autofd int deployment_dfd = -1;
@@ -1893,6 +1948,76 @@ install_deployment_kernel (OstreeSysroot   *sysroot,
 
       /* these are used lower down to populate the bootconfig */
       g_ptr_array_add (overlay_initrds, g_steal_pointer (&destpath));
+    }
+
+  /* search for legacy directory for additional files to copy to /boot/ostree/$os-$bootcsum/ */
+  const char legacy_path[] = "usr/lib/ostree-boot";
+  glnx_autofd int legacy_dfd = glnx_opendirat_with_errno (deployment_dfd, legacy_path, TRUE);
+  if (legacy_dfd >= 0)
+    {
+      if (fstatat (legacy_dfd, ".ostree-bootcsumdir-source", &stbuf, 0) == 0)
+        {
+          if (!glnx_dirfd_iterator_init_at (legacy_dfd, ".", FALSE, &dfd_iter, error))
+            return FALSE;
+
+          while (TRUE)
+            {
+              struct dirent *dent;
+
+              if (!glnx_dirfd_iterator_next_dent (&dfd_iter, &dent, cancellable, error))
+                return FALSE;
+              if (dent == NULL)
+                break;
+
+              /* Skip special files - vmlinuz-* and initramfs-* are handled separately */
+              if (g_str_has_prefix (dent->d_name, "vmlinuz-") ||
+			      g_str_has_prefix (dent->d_name, "initramfs-") ||
+			      g_str_has_prefix (dent->d_name, ".ostree-bootcsumdir-source"))
+                continue;
+
+              if (fstatat (bootcsum_dfd, dent->d_name, &stbuf, AT_SYMLINK_NOFOLLOW) != 0)
+                {
+                  if (errno != ENOENT)
+                    {
+                      glnx_set_prefix_error_from_errno (error, "fstatat %s", dent->d_name);
+                      return FALSE;
+                    }
+
+                  if (fstatat (dfd_iter.fd, dent->d_name, &stbuf, AT_SYMLINK_NOFOLLOW) != 0)
+                    {
+                      glnx_set_error_from_errno (error);
+                      return FALSE;
+                    }
+
+                  if (S_ISDIR (stbuf.st_mode))
+                    {
+                      if (!hardlink_or_copy_dir_recurse (legacy_dfd, bootcsum_dfd, dent->d_name,
+                                                         TRUE, sysroot->debug_flags, cancellable, error))
+                        return FALSE;
+                    }
+                  else
+                    {
+                      if (!hardlink_or_copy_at (legacy_dfd, dent->d_name, bootcsum_dfd, dent->d_name,
+                                                sysroot->debug_flags, cancellable, error))
+                        return FALSE;
+                    }
+                }
+            }
+        }
+      else
+        {
+          if (errno != ENOENT)
+            {
+              glnx_set_prefix_error_from_errno (error, "fstatat %s", ".ostree-bootcsumdir-source");
+              return FALSE;
+            }
+        }
+      glnx_close_fd (&legacy_dfd);
+    }
+  else
+    {
+      if (errno != ENOENT)
+        return glnx_throw_errno_prefix (error, "openat(%s)", legacy_path);
     }
 
   g_autofree char *contents = NULL;
