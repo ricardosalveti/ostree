@@ -35,5 +35,6 @@ assert_has_file sysroot/boot/ostree/testos-${bootcsum}/1
 assert_file_has_content sysroot/boot/ostree/testos-${bootcsum}/1 "1"
 assert_has_file sysroot/boot/ostree/testos-${bootcsum}/subdir/2
 assert_file_has_content sysroot/boot/ostree/testos-${bootcsum}/subdir/2 "2"
+assert_file_has_content sysroot/boot/uEnv.txt "bootdir="
 
 echo "ok boot dir with .ostree-bootcsumdir-source"
